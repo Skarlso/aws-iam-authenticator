@@ -207,7 +207,7 @@ func (c *Server) getHandler(backendMapper BackendMapper, ec2DescribeQps int, ec2
 
 	h := &handler{
 		verifier:                  token.NewVerifier(c.ClusterID, c.PartitionID, instanceRegion),
-		ec2Provider:               ec2provider.New(c.ServerEC2DescribeInstancesRoleARN, instanceRegion, ec2DescribeQps, ec2DescribeBurst),
+		ec2Provider:               ec2provider.New(c.ServerEC2DescribeInstancesRoleARN, c.SourceARN, instanceRegion, ec2DescribeQps, ec2DescribeBurst),
 		clusterID:                 c.ClusterID,
 		backendMapper:             backendMapper,
 		scrubbedAccounts:          c.Config.ScrubbedAWSAccounts,
@@ -394,6 +394,7 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 		userExtra["sessionName"] = authenticationv1beta1.ExtraValue{identity.SessionName}
 		userExtra["accessKeyId"] = authenticationv1beta1.ExtraValue{identity.AccessKeyID}
 		userExtra["principalId"] = authenticationv1beta1.ExtraValue{identity.UserID}
+		userExtra["sigs.k8s.io/aws-iam-authenticator/principalId"] = authenticationv1beta1.ExtraValue{identity.UserID}
 	}
 
 	json.NewEncoder(w).Encode(authenticationv1beta1.TokenReview{

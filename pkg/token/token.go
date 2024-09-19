@@ -34,6 +34,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
+	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/aws/aws-sdk-go/service/sts/stsiface"
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,6 +44,7 @@ import (
 	clientauthv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
 	"sigs.k8s.io/aws-iam-authenticator/pkg"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/arn"
+	"sigs.k8s.io/aws-iam-authenticator/pkg/filecache"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/metrics"
 )
 
@@ -110,7 +112,6 @@ type GetTokenOptions struct {
 	AssumeRoleARN        string
 	AssumeRoleExternalID string
 	SessionName          string
-	Session              *session.Session
 }
 
 // FormatError is returned when there is a problem with token that is
@@ -181,12 +182,6 @@ type getCallerIdentityWrapper struct {
 
 // Generator provides new tokens for the AWS IAM Authenticator.
 type Generator interface {
-	// Get a token using credentials in the default credentials chain.
-	Get(string) (Token, error)
-	// GetWithRole creates a token by assuming the provided role, using the credentials in the default chain.
-	GetWithRole(clusterID, roleARN string) (Token, error)
-	// GetWithRoleForSession creates a token by assuming the provided role, using the provided session.
-	GetWithRoleForSession(clusterID string, roleARN string, sess *session.Session) (Token, error)
 	// Get a token using the provided options
 	GetWithOptions(options *GetTokenOptions) (Token, error)
 	// GetWithSTS returns a token valid for clusterID using the given STS client.
@@ -198,6 +193,7 @@ type Generator interface {
 type generator struct {
 	forwardSessionName bool
 	cache              bool
+	nowFunc            func() time.Time
 }
 
 // NewGenerator creates a Generator and returns it.
@@ -205,32 +201,8 @@ func NewGenerator(forwardSessionName bool, cache bool) (Generator, error) {
 	return generator{
 		forwardSessionName: forwardSessionName,
 		cache:              cache,
+		nowFunc:            time.Now,
 	}, nil
-}
-
-// Get uses the directly available AWS credentials to return a token valid for
-// clusterID. It follows the default AWS credential handling behavior.
-func (g generator) Get(clusterID string) (Token, error) {
-	return g.GetWithOptions(&GetTokenOptions{ClusterID: clusterID})
-}
-
-// GetWithRole assumes the given AWS IAM role and returns a token valid for
-// clusterID. If roleARN is empty, behaves like Get (does not assume a role).
-func (g generator) GetWithRole(clusterID string, roleARN string) (Token, error) {
-	return g.GetWithOptions(&GetTokenOptions{
-		ClusterID:     clusterID,
-		AssumeRoleARN: roleARN,
-	})
-}
-
-// GetWithRoleForSession assumes the given AWS IAM role for the given session and behaves
-// like GetWithRole.
-func (g generator) GetWithRoleForSession(clusterID string, roleARN string, sess *session.Session) (Token, error) {
-	return g.GetWithOptions(&GetTokenOptions{
-		ClusterID:     clusterID,
-		AssumeRoleARN: roleARN,
-		Session:       sess,
-	})
 }
 
 // StdinStderrTokenProvider gets MFA token from standard input.
@@ -249,46 +221,46 @@ func (g generator) GetWithOptions(options *GetTokenOptions) (Token, error) {
 		return Token{}, fmt.Errorf("ClusterID is required")
 	}
 
-	if options.Session == nil {
-		// create a session with the "base" credentials available
-		// (from environment variable, profile files, EC2 metadata, etc)
-		sess, err := session.NewSessionWithOptions(session.Options{
-			AssumeRoleTokenProvider: StdinStderrTokenProvider,
-			SharedConfigState:       session.SharedConfigEnable,
-		})
-		if err != nil {
-			return Token{}, fmt.Errorf("could not create session: %v", err)
-		}
-		sess.Handlers.Build.PushFrontNamed(request.NamedHandler{
-			Name: "authenticatorUserAgent",
-			Fn: request.MakeAddToUserAgentHandler(
-				"aws-iam-authenticator", pkg.Version),
-		})
-		if options.Region != "" {
-			sess = sess.Copy(aws.NewConfig().WithRegion(options.Region).WithSTSRegionalEndpoint(endpoints.RegionalSTSEndpoint))
-		}
+	// create a session with the "base" credentials available
+	// (from environment variable, profile files, EC2 metadata, etc)
+	sess, err := session.NewSessionWithOptions(session.Options{
+		AssumeRoleTokenProvider: StdinStderrTokenProvider,
+		SharedConfigState:       session.SharedConfigEnable,
+	})
+	if err != nil {
+		return Token{}, fmt.Errorf("could not create session: %v", err)
+	}
+	sess.Handlers.Build.PushFrontNamed(request.NamedHandler{
+		Name: "authenticatorUserAgent",
+		Fn: request.MakeAddToUserAgentHandler(
+			"aws-iam-authenticator", pkg.Version),
+	})
+	if options.Region != "" {
+		sess = sess.Copy(aws.NewConfig().WithRegion(options.Region).WithSTSRegionalEndpoint(endpoints.RegionalSTSEndpoint))
+	}
 
-		if g.cache {
-			// figure out what profile we're using
-			var profile string
-			if v := os.Getenv("AWS_PROFILE"); len(v) > 0 {
-				profile = v
-			} else {
-				profile = session.DefaultSharedConfigProfile
-			}
-			// create a cacheing Provider wrapper around the Credentials
-			if cacheProvider, err := NewFileCacheProvider(options.ClusterID, profile, options.AssumeRoleARN, sess.Config.Credentials); err == nil {
-				sess.Config.Credentials = credentials.NewCredentials(&cacheProvider)
-			} else {
-				_, _ = fmt.Fprintf(os.Stderr, "unable to use cache: %v\n", err)
-			}
+	if g.cache {
+		// figure out what profile we're using
+		var profile string
+		if v := os.Getenv("AWS_PROFILE"); len(v) > 0 {
+			profile = v
+		} else {
+			profile = session.DefaultSharedConfigProfile
 		}
-
-		options.Session = sess
+		// create a cacheing Provider wrapper around the Credentials
+		if cacheProvider, err := filecache.NewFileCacheProvider(
+			options.ClusterID,
+			profile,
+			options.AssumeRoleARN,
+			filecache.V1CredentialToV2Provider(sess.Config.Credentials)); err == nil {
+			sess.Config.Credentials = credentials.NewCredentials(cacheProvider)
+		} else {
+			fmt.Fprintf(os.Stderr, "unable to use cache: %v\n", err)
+		}
 	}
 
 	// use an STS client based on the direct credentials
-	stsAPI := sts.New(options.Session)
+	stsAPI := sts.New(sess)
 
 	// if a roleARN was specified, replace the STS client with one that uses
 	// temporary credentials from that role.
@@ -323,13 +295,21 @@ func (g generator) GetWithOptions(options *GetTokenOptions) (Token, error) {
 		}
 
 		// create STS-based credentials that will assume the given role
-		creds := stscreds.NewCredentials(options.Session, options.AssumeRoleARN, sessionSetters...)
+		creds := stscreds.NewCredentials(sess, options.AssumeRoleARN, sessionSetters...)
 
 		// create an STS API interface that uses the assumed role's temporary credentials
-		stsAPI = sts.New(options.Session, &aws.Config{Credentials: creds})
+		stsAPI = sts.New(sess, &aws.Config{Credentials: creds})
 	}
 
 	return g.GetWithSTS(options.ClusterID, stsAPI)
+}
+
+func getNamedSigningHandler(nowFunc func() time.Time) request.NamedHandler {
+	return request.NamedHandler{
+		Name: "v4.SignRequestHandler", Fn: func(req *request.Request) {
+			v4.SignSDKRequestWithCurrentTime(req, nowFunc)
+		},
+	}
 }
 
 // GetWithSTS returns a token valid for clusterID using the given STS client.
@@ -338,19 +318,22 @@ func (g generator) GetWithSTS(clusterID string, stsAPI stsiface.STSAPI) (Token, 
 	request, _ := stsAPI.GetCallerIdentityRequest(&sts.GetCallerIdentityInput{})
 	request.HTTPRequest.Header.Add(clusterIDHeader, clusterID)
 
+	// override the Sign handler so we can control the now time for testing.
+	request.Handlers.Sign.Swap("v4.SignRequestHandler", getNamedSigningHandler(g.nowFunc))
+
 	// Sign the request.  The expires parameter (sets the x-amz-expires header) is
 	// currently ignored by STS, and the token expires 15 minutes after the x-amz-date
 	// timestamp regardless.  We set it to 60 seconds for backwards compatibility (the
 	// parameter is a required argument to Presign(), and authenticators 0.3.0 and older are expecting a value between
 	// 0 and 60 on the server side).
 	// https://github.com/aws/aws-sdk-go/issues/2167
-	presignedURLString, err := request.Presign(requestPresignParam)
+	presignedURLString, err := request.Presign(requestPresignParam * time.Second)
 	if err != nil {
 		return Token{}, err
 	}
 
 	// Set token expiration to 1 minute before the presigned URL expires for some cushion
-	tokenExpiration := time.Now().Local().Add(presignedURLExpiration - 1*time.Minute)
+	tokenExpiration := g.nowFunc().Local().Add(presignedURLExpiration - 1*time.Minute)
 	// TODO: this may need to be a constant-time base64 encoding
 	return Token{v1Prefix + base64.RawURLEncoding.EncodeToString([]byte(presignedURLString)), tokenExpiration}, nil
 }
